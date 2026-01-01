@@ -109,7 +109,7 @@ Color-coded rows for quick status recognition:
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │                   Orders Blotter                         │   │
-│  │  Timestamp | ClOrdId | Symbol | Side | ... | Actions (⋮) 
+│  │    Timestamp  |  ClOrdId  |  Side  |  ...  |  Actions    │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────────┐   │
