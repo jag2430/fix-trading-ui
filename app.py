@@ -45,6 +45,33 @@ def safe_get_json(url: str, timeout: int = 2):
     return None
 
 
+def search_symbols(query: str, timeout: int = 2):
+    """Search for symbols using the FIX Client API"""
+    if not query or len(query.strip()) < 1:
+        return []
+    try:
+        r = requests.get(f"{API_BASE_URL}/symbols/search", params={"q": query.strip()}, timeout=timeout)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("results", [])
+    except Exception:
+        pass
+    return []
+
+
+def validate_symbol(symbol: str, timeout: int = 2):
+    """Validate a symbol using the FIX Client API"""
+    if not symbol:
+        return None
+    try:
+        r = requests.get(f"{API_BASE_URL}/symbols/{symbol.strip().upper()}/validate", timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
 def format_time(ts):
     if not ts:
         return ""
@@ -232,17 +259,30 @@ def trading_drawer():
                     ),
                     dmc.Space(h=15),
 
-                    # Symbol input with autocomplete suggestions
-                    dmc.TextInput(
+                    # Symbol input with autocomplete
+                    dmc.Select(
                         id="drawer-symbol-input",
                         label="Symbol",
-                        placeholder="e.g. AAPL, TSLA, MSFT",
-                        styles={"input": {"textTransform": "uppercase", "fontWeight": 800}},
-                        rightSection=dmc.ActionIcon(
-                            html.I(className="fa-solid fa-magnifying-glass"),
-                            variant="subtle",
-                            size="sm",
-                        ),
+                        placeholder="Search symbol (e.g. AAPL, TSLA)",
+                        searchable=True,
+                        clearable=True,
+                        allowDeselect=False,
+                        nothingFoundMessage="No symbols found - type to search",
+                        data=[],  # Will be populated dynamically
+                        styles={
+                            "input": {"textTransform": "uppercase", "fontWeight": 800},
+                        },
+                        comboboxProps={"withinPortal": False, "zIndex": 20000},
+                        leftSection=html.I(className="fa-solid fa-magnifying-glass", style={"fontSize": "12px"}),
+                    ),
+                    # Hidden store to track the selected symbol separately
+                    dcc.Store(id="selected-symbol-store", data=None),
+                    
+                    # Company name and validation display
+                    html.Div(
+                        id="drawer-symbol-info",
+                        children=[],
+                        style={"minHeight": "24px", "marginTop": "4px"},
                     ),
 
                     # Quick quantity buttons
@@ -805,6 +845,9 @@ app.layout = dmc.MantineProvider(
 
         # Store to track last action cell click (for fixing the multi-click issue)
         dcc.Store(id="last-actions-click", data={"row": None, "clOrdId": None, "timestamp": 0}),
+        
+        # Store for validated symbol data
+        dcc.Store(id="validated-symbol-data", data=None),
 
         # Trading Drawer (initially hidden)
         trading_drawer(),
@@ -1215,6 +1258,234 @@ def toggle_trading_drawer(n_clicks, opened):
     return opened
 
 
+# =============================================================================
+# SYMBOL SEARCH / AUTOCOMPLETE CALLBACKS
+# =============================================================================
+
+@callback(
+    Output("drawer-symbol-input", "data"),
+    Output("selected-symbol-store", "data"),
+    Input("drawer-symbol-input", "searchValue"),
+    Input("drawer-symbol-input", "value"),
+    State("selected-symbol-store", "data"),
+    State("drawer-symbol-input", "data"),
+    prevent_initial_call=True,
+)
+def update_symbol_options(search_value, selected_value, stored_symbol, current_data):
+    """
+    Update symbol dropdown options based on search query.
+    Fetches from the FIX Client /api/symbols/search endpoint.
+    Preserves the currently selected value in options.
+    """
+    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
+    triggered_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    
+    # If a value was just selected, store it and preserve the option
+    if triggered_id == "drawer-symbol-input" and "value" in triggered_prop:
+        if selected_value:
+            # Find the full option data for the selected value
+            selected_option = None
+            if current_data:
+                for opt in current_data:
+                    if opt.get("value") == selected_value:
+                        selected_option = opt
+                        break
+            
+            if selected_option:
+                return [selected_option], {"symbol": selected_value, "option": selected_option}
+            else:
+                # Create a basic option if not found
+                basic_option = {"value": selected_value, "label": selected_value}
+                return [basic_option], {"symbol": selected_value, "option": basic_option}
+        else:
+            # Value was cleared
+            return [], None
+    
+    # If searchValue triggered this but we have a stored symbol, keep showing it
+    if stored_symbol and stored_symbol.get("symbol"):
+        stored_option = stored_symbol.get("option", {"value": stored_symbol["symbol"], "label": stored_symbol["symbol"]})
+        stored_symbol_value = stored_symbol["symbol"]
+        
+        # If no search or empty search, just show the stored option
+        if not search_value or len(search_value.strip()) < 1:
+            return [stored_option], dash.no_update
+        
+        # If searching, fetch results but include stored option
+        results = search_symbols(search_value)
+        options = []
+        seen_values = set()  # Track seen values to avoid duplicates
+        stored_in_results = False
+        
+        for r in results:
+            symbol = r.get("symbol", "")
+            
+            # Skip if we've already seen this symbol
+            if symbol in seen_values:
+                continue
+            seen_values.add(symbol)
+            
+            description = r.get("description", "")
+            symbol_type = r.get("type", "")
+            
+            if description:
+                label = f"{symbol} - {description}"
+            else:
+                label = symbol
+            
+            if symbol_type and symbol_type != "Common Stock":
+                label = f"{label} ({symbol_type})"
+            
+            options.append({"value": symbol, "label": label})
+            
+            if symbol == stored_symbol_value:
+                stored_in_results = True
+        
+        # Only add the stored option if it's not already in results
+        if not stored_in_results and stored_symbol_value not in seen_values:
+            options.insert(0, stored_option)
+        
+        return options if options else [stored_option], dash.no_update
+    
+    # No stored symbol - just do a fresh search
+    if not search_value or len(search_value.strip()) < 1:
+        return [], dash.no_update
+    
+    results = search_symbols(search_value)
+    
+    options = []
+    seen_values = set()  # Track seen values to avoid duplicates
+    
+    for r in results:
+        symbol = r.get("symbol", "")
+        
+        # Skip if we've already seen this symbol
+        if symbol in seen_values:
+            continue
+        seen_values.add(symbol)
+        
+        description = r.get("description", "")
+        symbol_type = r.get("type", "")
+        
+        if description:
+            label = f"{symbol} - {description}"
+        else:
+            label = symbol
+        
+        if symbol_type and symbol_type != "Common Stock":
+            label = f"{label} ({symbol_type})"
+        
+        options.append({"value": symbol, "label": label})
+    
+    return options if options else [], dash.no_update
+
+
+@callback(
+    Output("drawer-symbol-info", "children"),
+    Output("validated-symbol-data", "data"),
+    Input("drawer-symbol-input", "value"),
+    State("validated-symbol-data", "data"),
+    prevent_initial_call=True,
+)
+def validate_and_display_symbol(symbol, previous_validation):
+    """
+    Validate selected symbol and display company info.
+    Shows company name, current price, and validation status.
+    """
+    if not symbol:
+        return [], None
+    
+    # Validate the symbol
+    validation = validate_symbol(symbol)
+    
+    if not validation:
+        return [
+            dmc.Text(
+                "Unable to validate symbol",
+                size="xs",
+                c="yellow",
+                style={"fontStyle": "italic"},
+            )
+        ], None
+    
+    is_valid = validation.get("valid", False)
+    company_name = validation.get("name", "")
+    current_price = validation.get("currentPrice")
+    change = validation.get("change")
+    change_percent = validation.get("changePercent")
+    validation_msg = validation.get("validationMessage", "")
+    
+    if not is_valid:
+        return [
+            dmc.Group(
+                gap="xs",
+                children=[
+                    html.I(className="fa-solid fa-circle-xmark", style={"color": "#ff6b6b", "fontSize": "12px"}),
+                    dmc.Text(
+                        validation_msg or "Invalid symbol",
+                        size="xs",
+                        c="red",
+                    ),
+                ],
+            )
+        ], None
+    
+    # Build the info display for valid symbols
+    info_parts = []
+    
+    # Valid indicator
+    info_parts.append(html.I(className="fa-solid fa-circle-check", style={"color": "#00d4aa", "fontSize": "12px"}))
+    
+    # Company name
+    if company_name:
+        info_parts.append(
+            dmc.Text(
+                company_name,
+                size="xs",
+                c="dimmed",
+                fw=500,
+                style={"maxWidth": "200px", "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"},
+            )
+        )
+    
+    # Price info
+    if current_price is not None:
+        price_text = f"${float(current_price):.2f}"
+        
+        # Add change info if available
+        if change is not None and change_percent is not None:
+            change_val = float(change)
+            change_pct = float(change_percent)
+            change_color = "#00d4aa" if change_val >= 0 else "#ff6b6b"
+            change_sign = "+" if change_val >= 0 else ""
+            price_text = f"${float(current_price):.2f} ({change_sign}{change_val:.2f}, {change_sign}{change_pct:.2f}%)"
+            
+            info_parts.append(
+                dmc.Text(
+                    price_text,
+                    size="xs",
+                    c=change_color,
+                    fw=600,
+                )
+            )
+        else:
+            info_parts.append(
+                dmc.Text(
+                    price_text,
+                    size="xs",
+                    c="blue",
+                    fw=600,
+                )
+            )
+    
+    return [
+        dmc.Group(
+            gap="xs",
+            align="center",
+            children=info_parts,
+        )
+    ], validation
+
+
 @callback(
     Output("drawer-order-status-msg", "children"),
     Output("drawer-symbol-input", "value"),
@@ -1222,6 +1493,8 @@ def toggle_trading_drawer(n_clicks, opened):
     Output("drawer-price-input", "value"),
     Output("drawer-stop-price-input", "value"),
     Output("order-submission-timestamp", "data"),
+    Output("selected-symbol-store", "data", allow_duplicate=True),
+    Output("drawer-symbol-info", "children", allow_duplicate=True),
 
     Input("drawer-buy-btn", "n_clicks"),
     Input("drawer-sell-btn", "n_clicks"),
@@ -1234,16 +1507,17 @@ def toggle_trading_drawer(n_clicks, opened):
     State("drawer-price-input", "value"),
     State("drawer-stop-price-input", "value"),
     State("drawer-order-type-select", "value"),
+    State("validated-symbol-data", "data"),
     prevent_initial_call=True,
 )
 def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty5000,
-                         symbol, quantity, price, stop_price, order_type):
+                         symbol, quantity, price, stop_price, order_type, validated_data):
     """Handle order submission from the trading drawer"""
     import time
 
-    # 6 outputs in this callback:
-    # (status msg, symbol, quantity, price, stop_price, submission_timestamp)
-    no_update = (dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+    # 8 outputs in this callback:
+    # (status msg, symbol, quantity, price, stop_price, submission_timestamp, selected_symbol_store, symbol_info)
+    no_update = (dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update)
 
     if not ctx.triggered:
         return no_update
@@ -1260,13 +1534,32 @@ def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty50
     if not symbol:
         return (
             dmc.Alert("Enter a symbol", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        )
+
+    # Validate symbol before submission
+    if validated_data is None:
+        # Symbol wasn't validated yet, try to validate now
+        validated_data = validate_symbol(symbol)
+    
+    if validated_data is None or not validated_data.get("valid", False):
+        error_msg = "Invalid symbol"
+        if validated_data and validated_data.get("validationMessage"):
+            error_msg = validated_data.get("validationMessage")
+        return (
+            dmc.Alert(
+                f"Cannot submit order: {error_msg}",
+                color="red",
+                variant="light",
+                title="Symbol Validation Failed",
+            ),
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         )
 
     if not quantity:
         return (
             dmc.Alert("Enter quantity", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         )
 
     order_type = (order_type or "LIMIT").upper()
@@ -1275,7 +1568,7 @@ def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty50
     if order_type == "LIMIT" and (price is None or price == ""):
         return (
             dmc.Alert("Enter limit price for LIMIT order", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         )
 
     # Build payload
@@ -1296,25 +1589,38 @@ def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty50
             current_time = time.time()
 
             price_info = f" @ ${float(price):.2f}" if order_type == "LIMIT" else ""
+            
+            # Include company name in confirmation if available
+            company_name = validated_data.get("name", "")
+            symbol_display = f"{symbol} ({company_name})" if company_name else symbol
 
             alert = dmc.Alert(
-                f"✓ {side} {order_type} order sent: {cid}{price_info}",
+                f"✓ {side} {order_type} order sent for {symbol_display}: {cid}{price_info}",
                 color="green" if side == "BUY" else "red",
                 variant="light",
                 title="Order Submitted",
             )
 
             # Clear fields immediately while drawer stays open
-            return (alert, "", "", "", "", current_time)
+            # Use "" (empty string) instead of None to properly clear NumberInput fields visually
+            return (alert, None, "", "", "", current_time, None, [])
 
+        # Handle error response
+        error_detail = ""
+        try:
+            error_json = r.json()
+            error_detail = error_json.get("message", "")
+        except Exception:
+            pass
+        
         return (
-            dmc.Alert("Order failed", color="red", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dmc.Alert(f"Order failed{': ' + error_detail if error_detail else ''}", color="red", variant="light"),
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         )
     except Exception as e:
         return (
             dmc.Alert(f"Error: {str(e)}", color="red", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
         )
 
 @callback(
@@ -1351,14 +1657,14 @@ def set_quick_quantity(qty100, qty500, qty1000, qty5000, current_qty):
     prevent_initial_call=True,
 )
 def auto_dismiss_notification(n_intervals, submission_time, current_msg):
-    """Auto-dismiss notification after 7 seconds"""
+    """Auto-dismiss notification after 4 seconds"""
     import time
     
     if submission_time is None:
         return dash.no_update
     
-    # Check if 7 seconds have passed
-    if time.time() - submission_time >= 7:
+    # Check if 4 seconds have passed
+    if time.time() - submission_time >= 4:
         return ""  # Clear the notification
     
     return dash.no_update
