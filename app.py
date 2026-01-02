@@ -18,7 +18,7 @@ import dash_mantine_components as dmc
 # =============================================================================
 
 API_BASE_URL = "http://localhost:8081/api"
-REFRESH_MS = 2000
+REFRESH_MS = 500
 
 external_stylesheets = [
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
