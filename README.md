@@ -84,6 +84,7 @@ SCREENSHOT PLACEHOLDER: Order entry drawer with symbol validation
 - Tip: Show the green checkmark validation state
 -->
 ![Order Entry](docs/images/order-entry.png)
+
 *Slide-out order entry panel with Finnhub-powered symbol search and validation*
 
 ### Order Management
@@ -98,6 +99,7 @@ SCREENSHOT PLACEHOLDER: Order actions modal
 - Show: Modal open with amend fields (new quantity, new price) for a working order
 -->
 ![Order Actions](docs/images/order-actions.png)
+
 *Modal dialog for amending or cancelling working orders*
 
 ### Real-Time Monitoring
@@ -176,6 +178,7 @@ SCREENSHOT PLACEHOLDER: Symbol search dropdown
 - Show: Symbol input with dropdown showing autocomplete results (e.g., searching "AA" shows AAPL, AAL, etc.)
 -->
 ![Symbol Search](docs/images/symbol-search.png)
+
 *Real-time symbol autocomplete powered by Finnhub API*
 
 ### Orders Blotter
@@ -186,6 +189,7 @@ SCREENSHOT PLACEHOLDER: Orders blotter with various statuses
 - Tip: Include both BUY and SELL orders to show color coding
 -->
 ![Orders Blotter](docs/images/orders-blotter.png)
+
 *Orders blotter with color-coded sides and status highlighting*
 
 ### Portfolio Blotter Integration
@@ -195,7 +199,7 @@ SCREENSHOT PLACEHOLDER: Portfolio blotter positions tab
 - Show: Positions table with P&L, pie chart showing allocation
 - Note: This screenshot is from the portfolio-blotter repo
 -->
-![Portfolio Blotter](docs/images/portfolio-blotter.png)
+![Portfolio Blotter](docs/images/portfolio-dashboard.png)
 *Real-time position monitoring with P&L from the companion Portfolio Blotter application*
 
 ---

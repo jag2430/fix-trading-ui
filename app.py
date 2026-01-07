@@ -191,27 +191,28 @@ def main_navbar():
                     align="center",
                     children=[
                         dmc.Button(
-                            "Trading",
+                            "Trade",
                             id="trading-btn",
-                            leftSection=html.I(className="fa-solid fa-trade-federation"),
+                            leftSection=html.I(className="fa-solid fa-arrow-right-arrow-left"),
                             variant="light",
                             color="blue",
+                            style={"marginLeft": "45px"},
                         ),
-                        dmc.Button(
-                            "Analytics",
-                            leftSection=html.I(className="fa-solid fa-chart-pie"),
-                            variant="subtle",
-                        ),
-                        dmc.Button(
-                            "Risk",
-                            leftSection=html.I(className="fa-solid fa-shield-halved"),
-                            variant="subtle",
-                        ),
-                        dmc.Button(
-                            "Reports",
-                            leftSection=html.I(className="fa-solid fa-file-lines"),
-                            variant="subtle",
-                        ),
+#                         dmc.Button(
+#                             "Analytics",
+#                             leftSection=html.I(className="fa-solid fa-chart-pie"),
+#                             variant="subtle",
+#                         ),
+#                         dmc.Button(
+#                             "Risk",
+#                             leftSection=html.I(className="fa-solid fa-shield-halved"),
+#                             variant="subtle",
+#                         ),
+#                         dmc.Button(
+#                             "Reports",
+#                             leftSection=html.I(className="fa-solid fa-file-lines"),
+#                             variant="subtle",
+#                         ),
                     ],
                 ),
 
@@ -236,7 +237,7 @@ def trading_drawer():
         title=dmc.Group(
             gap="xs",
             children=[
-                html.I(className="fa-solid fa-trade-federation", style={"fontSize": "18px"}),
+                html.I(className="fa-solid fa-arrow-right-arrow-left", style={"fontSize": "18px"}),
                 dmc.Text("Quick Trade", fw=700, size="lg"),
             ],
         ),
