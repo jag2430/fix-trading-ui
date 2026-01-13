@@ -604,6 +604,7 @@ def trading_drawer():
                         allowDeselect=False,
                         nothingFoundMessage="No symbols found - type to search",
                         data=[],
+                        value=None,
                         styles={
                             "input": {"textTransform": "uppercase", "fontWeight": 800},
                         },
@@ -1142,6 +1143,8 @@ app.layout = dmc.MantineProvider(
         # Store for order submission timestamp (to auto-dismiss after timeout)
         dcc.Store(id="order-submission-timestamp", data=None),
 
+        dcc.Store(id="symbol-search-prev", data=""),
+
         dcc.Store(id="clicked-outside-table", data=0),
 
         # Store to track last action cell click
@@ -1478,26 +1481,36 @@ def toggle_trading_drawer(n_clicks, opened):
         return not opened
     return opened
 
-
 @callback(
     Output("drawer-symbol-input", "data"),
     Output("selected-symbol-store", "data"),
+    Output("symbol-search-prev", "data"),
     Input("drawer-symbol-input", "searchValue"),
     Input("drawer-symbol-input", "value"),
     State("selected-symbol-store", "data"),
     State("drawer-symbol-input", "data"),
+    State("symbol-search-prev", "data"),
     prevent_initial_call=True,
 )
-def update_symbol_options(search_value, selected_value, stored_symbol, current_data):
+def update_symbol_options(search_value, selected_value, stored_symbol, current_data, prev_search):
     """
     Update symbol dropdown options based on search query.
     Fetches from the FIX Client /api/symbols/search endpoint.
     """
-    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
-    triggered_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+    import dash
+    
+    if not ctx.triggered:
+        return dash.no_update, dash.no_update, dash.no_update
+    
+    # Get the exact property that triggered this callback
+    triggered_prop_id = ctx.triggered[0]["prop_id"]
+    
+    # Use exact match instead of substring to avoid "value" matching "searchValue"
+    is_value_trigger = triggered_prop_id == "drawer-symbol-input.value"
+    is_search_trigger = triggered_prop_id == "drawer-symbol-input.searchValue"
 
     # If a value was just selected, store it and preserve the option
-    if triggered_id == "drawer-symbol-input" and "value" in triggered_prop:
+    if is_value_trigger:
         if selected_value:
             selected_option = None
             if current_data:
@@ -1507,28 +1520,38 @@ def update_symbol_options(search_value, selected_value, stored_symbol, current_d
                         break
 
             if selected_option:
-                return [selected_option], {"symbol": selected_value, "option": selected_option}
+                return [selected_option], {"symbol": selected_value, "option": selected_option}, prev_search
             else:
                 basic_option = {"value": selected_value, "label": selected_value}
-                return [basic_option], {"symbol": selected_value, "option": basic_option}
+                return [basic_option], {"symbol": selected_value, "option": basic_option}, prev_search
         else:
-            return [], None
+            # Only clear if we previously had a stored symbol
+            if stored_symbol:
+                return [], None, ""
+            else:
+                return dash.no_update, dash.no_update, prev_search
 
-    # If searchValue triggered this but we have a stored symbol, keep showing it
-    if stored_symbol and stored_symbol.get("symbol"):
-        stored_option = stored_symbol.get(
-            "option",
-            {"value": stored_symbol["symbol"], "label": stored_symbol["symbol"]}
-        )
-        stored_symbol_value = stored_symbol["symbol"]
+    # Handle search trigger
+    if is_search_trigger:
+        # If search is empty
+        sv = (search_value or "").strip()
+        prev = (prev_search or "").strip()
 
-        if not search_value or len(search_value.strip()) < 1:
-            return [stored_option], None  # Clear stored_symbol on empty search
+        if sv == "":
+            # startup / focus bounce: keep whatever is there
+            if prev == "":
+                return dash.no_update, dash.no_update, prev_search
 
-        results = search_symbols(search_value)
+            # user cleared: force empty options so nothingFoundMessage appears
+            return [], None, ""
+        
+        # We have a search value - perform the search
+        results = search_symbols(sv)
+        if results is None:
+            return dash.no_update, dash.no_update, prev_search  # Don't clear on error
+        
         options = []
         seen_values = set()
-        stored_in_results = False
 
         for r in results:
             symbol = r.get("symbol", "")
@@ -1545,40 +1568,20 @@ def update_symbol_options(search_value, selected_value, stored_symbol, current_d
 
             options.append({"value": symbol, "label": label})
 
-            if symbol == stored_symbol_value:
-                stored_in_results = True
+        # If we have a stored symbol, make sure it's in the options
+        if stored_symbol and stored_symbol.get("symbol"):
+            stored_symbol_value = stored_symbol["symbol"]
+            if stored_symbol_value not in seen_values:
+                stored_option = stored_symbol.get(
+                    "option",
+                    {"value": stored_symbol_value, "label": stored_symbol_value}
+                )
+                options.insert(0, stored_option)
 
-        if not stored_in_results and stored_symbol_value not in seen_values:
-            options.insert(0, stored_option)
+        return (options if options else []), dash.no_update, sv
 
-        return options if options else [stored_option], None
-
-    # No stored symbol - just do a fresh search
-    if not search_value or len(search_value.strip()) < 1:
-        return [], None
-
-    results = search_symbols(search_value)
-    if results is None:
-        return dash.no_update, dash.no_update  # Don't clear on error
-    options = []
-    seen_values = set()
-
-    for r in results:
-        symbol = r.get("symbol", "")
-        if symbol in seen_values:
-            continue
-        seen_values.add(symbol)
-
-        description = r.get("description", "")
-        symbol_type = r.get("type", "")
-
-        label = f"{symbol} - {description}" if description else symbol
-        if symbol_type and symbol_type != "Common Stock":
-            label = f"{label} ({symbol_type})"
-
-        options.append({"value": symbol, "label": label})
-
-    return options if options else [], None
+    # Unknown trigger
+    return dash.no_update, dash.no_update, prev_search
 
 
 @callback(
