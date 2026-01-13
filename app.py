@@ -3,11 +3,16 @@ FIX OEMS - Order & Execution Management System
 Professional Trading Dashboard (Dash Mantine Components, compatible with dmc==0.14.7)
 """
 
+import json
+import os
+import threading
+import time
 from datetime import datetime
-import requests
 
-from dash import Dash, dcc, html, Input, Output, State, callback, dash_table, dash
-from dash import _dash_renderer, ctx
+import redis
+import requests
+from dash import Dash, dcc, html, Input, Output, State, callback, dash_table, ctx
+from dash import _dash_renderer
 
 _dash_renderer._set_react_version("18.2.0")
 
@@ -17,8 +22,18 @@ import dash_mantine_components as dmc
 # Configuration
 # =============================================================================
 
-API_BASE_URL = "http://localhost:8081/api"
-REFRESH_MS = 500
+API_BASE_URL = os.getenv("FIX_CLIENT_URL", "http://localhost:8081") + "/api"
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REFRESH_MS = int(os.getenv("REFRESH_MS", "500"))
+NOTIFICATION_TIMEOUT_SECONDS = 4
+NOTIFICATION_CHECK_INTERVAL_MS = 1000
+
+# Redis channels (must match what FIX Client publishes to)
+REDIS_CHANNELS = {
+    "orders": "orders:updates",
+    "executions": "executions:updates",
+}
 
 external_stylesheets = [
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -31,48 +46,357 @@ app = Dash(
     suppress_callback_exceptions=True,
 )
 
+
+# =============================================================================
+# Shared State (in-memory, updated by Redis subscriber)
+# =============================================================================
+
+class SharedState:
+    """Thread-safe shared state updated by Redis subscriber."""
+    
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.orders = {}  # keyed by clOrdId for easy updates
+        self.executions = []
+        self.redis_connected = False
+    
+    def update_orders(self, orders_list):
+        """Replace all orders (used for initial load)."""
+        with self._lock:
+            self.orders = {o.get("clOrdId"): o for o in orders_list if o.get("clOrdId")}
+    
+    def update_order(self, order_data):
+        """Update a single order by clOrdId (used for Redis updates)."""
+        with self._lock:
+            cl_ord_id = order_data.get("clOrdId")
+            if cl_ord_id:
+                self.orders[cl_ord_id] = order_data
+                print(f"[Redis] Order updated: {cl_ord_id} -> {order_data.get('status')}")
+    
+    def add_execution(self, exec_data):
+        """Add an execution to the front of the list."""
+        with self._lock:
+            exec_id = exec_data.get("execId")
+            if exec_id:
+                self.executions = [e for e in self.executions if e.get("execId") != exec_id]
+            self.executions.insert(0, exec_data)
+            self.executions = self.executions[:100]
+            print(f"[Redis] Execution added: {exec_data.get('execType')} {exec_data.get('symbol')}")
+    
+    def set_executions(self, execs_list):
+        """Replace all executions (used for initial load)."""
+        with self._lock:
+            self.executions = list(execs_list)
+    
+    def set_redis_connected(self, connected: bool):
+        """Track Redis connection status."""
+        with self._lock:
+            self.redis_connected = connected
+    
+    def get_orders(self):
+        """Get all orders as a list."""
+        with self._lock:
+            return list(self.orders.values())
+    
+    def get_executions(self):
+        """Get all executions."""
+        with self._lock:
+            return list(self.executions)
+    
+    def is_redis_connected(self):
+        """Check if Redis is connected."""
+        with self._lock:
+            return self.redis_connected
+
+
+# Global shared state
+state = SharedState()
+
+
+# =============================================================================
+# Redis Subscriber (background thread)
+# =============================================================================
+
+class RedisSubscriber(threading.Thread):
+    """Background thread that subscribes to Redis and updates shared state."""
+    
+    def __init__(self, shared_state: SharedState):
+        super().__init__(daemon=True)
+        self.state = shared_state
+        self.running = True
+        self.pubsub = None
+    
+    def run(self):
+        retry_delay = 1
+        max_retry_delay = 30
+        
+        while self.running:
+            try:
+                redis_client = redis.Redis(
+                    host=REDIS_HOST,
+                    port=REDIS_PORT,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_keepalive=True,
+                )
+                redis_client.ping()
+                self.state.set_redis_connected(True)
+                print(f"[Redis] Connected to {REDIS_HOST}:{REDIS_PORT}")
+                retry_delay = 1
+                
+                self.pubsub = redis_client.pubsub()
+                self.pubsub.subscribe(
+                    REDIS_CHANNELS["orders"],
+                    REDIS_CHANNELS["executions"],
+                )
+                print(f"[Redis] Subscribed to: {list(REDIS_CHANNELS.values())}")
+                
+                # Use get_message with timeout instead of listen() 
+                # This is more reliable and matches portfolio-blotter's approach
+                while self.running:
+                    message = self.pubsub.get_message(timeout=1.0)
+                    if message and message["type"] == "message":
+                        self._handle_message(message)
+                        
+            except redis.ConnectionError as e:
+                self.state.set_redis_connected(False)
+                print(f"[Redis] Connection error: {e}, retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+            except Exception as e:
+                self.state.set_redis_connected(False)
+                print(f"[Redis] Error: {e}, retrying in {retry_delay}s...")
+                import traceback
+                traceback.print_exc()
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
+    
+    def _handle_message(self, message):
+        try:
+            channel = message["channel"]
+            data = message["data"]
+            
+            # Debug: log raw message
+            print(f"[Redis] Received on {channel}: {data[:200] if len(str(data)) > 200 else data}")
+            
+            if isinstance(data, bytes):
+                data = data.decode('utf-8')
+            
+            payload = json.loads(data)
+            
+            # Handle double-encoded JSON (FIX Client encodes twice)
+            if isinstance(payload, str):
+                print(f"[Redis] Detected double-encoded JSON, parsing again...")
+                payload = json.loads(payload)
+            
+            # Debug: log parsed payload
+            print(f"[Redis] Parsed payload type: {type(payload)}, keys: {payload.keys() if isinstance(payload, dict) else 'N/A'}")
+            
+            # Handle different payload formats
+            if isinstance(payload, dict):
+                if "type" in payload and "data" in payload:
+                    msg_type = payload.get("type")
+                    msg_data = payload.get("data", {})
+                    print(f"[Redis] Message type: {msg_type}")
+                else:
+                    msg_type = "DIRECT"
+                    msg_data = payload
+                    print(f"[Redis] Direct payload (no type/data wrapper)")
+            else:
+                print(f"[Redis] Unexpected payload format: {type(payload)}")
+                return
+            
+            if channel == REDIS_CHANNELS["orders"]:
+                if isinstance(msg_data, dict) and msg_data:
+                    print(f"[Redis] Updating order: {msg_data.get('clOrdId')} -> {msg_data.get('status')}")
+                    self.state.update_order(msg_data)
+            elif channel == REDIS_CHANNELS["executions"]:
+                if isinstance(msg_data, dict) and msg_data:
+                    print(f"[Redis] Adding execution: {msg_data.get('execId')} {msg_data.get('execType')}")
+                    self.state.add_execution(msg_data)
+                
+        except json.JSONDecodeError as e:
+            print(f"[Redis] Failed to parse message: {e}")
+            print(f"[Redis] Raw data was: {data[:500] if data else 'None'}")
+        except Exception as e:
+            print(f"[Redis] Error handling message: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def stop(self):
+        self.running = False
+
 # =============================================================================
 # Helpers
 # =============================================================================
 
 def safe_get_json(url: str, timeout: int = 2):
+    """Safely fetch JSON from a URL with proper error logging."""
     try:
         r = requests.get(url, timeout=timeout)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        return None
+        else:
+            print(f"[WARN] API returned status {r.status_code} for {url}")
+    except requests.exceptions.Timeout:
+        print(f"[WARN] Timeout fetching {url}")
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Connection error fetching {url}")
+    except json.JSONDecodeError as e:
+        print(f"[WARN] JSON decode error for {url}: {e}")
+    except Exception as e:
+        print(f"[ERROR] Unexpected error fetching {url}: {e}")
     return None
 
 
 def search_symbols(query: str, timeout: int = 2):
-    """Search for symbols using the FIX Client API"""
+    """Search for symbols using the FIX Client API."""
     if not query or len(query.strip()) < 1:
         return []
     try:
-        r = requests.get(f"{API_BASE_URL}/symbols/search", params={"q": query.strip()}, timeout=timeout)
+        r = requests.get(
+            f"{API_BASE_URL}/symbols/search",
+            params={"q": query.strip()},
+            timeout=timeout
+        )
         if r.status_code == 200:
             data = r.json()
             return data.get("results", [])
-    except Exception:
-        pass
-    return []
-
-
-def validate_symbol(symbol: str, timeout: int = 2):
-    """Validate a symbol using the FIX Client API"""
-    if not symbol:
-        return None
-    try:
-        r = requests.get(f"{API_BASE_URL}/symbols/{symbol.strip().upper()}/validate", timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
+        else:
+            print(f"[WARN] Symbol search returned status {r.status_code} for query '{query}'")
+    except requests.exceptions.Timeout:
+        print(f"[WARN] Symbol search timeout for query '{query}'")
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Symbol search connection error for query '{query}'")
+    except Exception as e:
+        print(f"[ERROR] Symbol search error for query '{query}': {e}")
     return None
 
 
+def validate_symbol(symbol: str, timeout: int = 2):
+    """Validate a symbol using the FIX Client API."""
+    if not symbol:
+        return None
+    try:
+        r = requests.get(
+            f"{API_BASE_URL}/symbols/{symbol.strip().upper()}/validate",
+            timeout=timeout
+        )
+        if r.status_code == 200:
+            return r.json()
+        else:
+            print(f"[WARN] Symbol validation returned status {r.status_code} for '{symbol}'")
+    except requests.exceptions.Timeout:
+        print(f"[WARN] Symbol validation timeout for '{symbol}'")
+    except requests.exceptions.ConnectionError:
+        print(f"[WARN] Symbol validation connection error for '{symbol}'")
+    except Exception as e:
+        print(f"[ERROR] Symbol validation error for '{symbol}': {e}")
+    return None
+
+
+def send_order_to_api(symbol: str, side: str, order_type: str, quantity: int, price: float = None):
+    """
+    Send order to FIX Client API.
+    
+    Returns:
+        tuple: (success: bool, result: dict if success else error_message: str)
+    """
+    payload = {
+        "symbol": symbol.upper(),
+        "side": side,
+        "orderType": order_type,
+        "quantity": quantity,
+    }
+    if order_type == "LIMIT" and price is not None:
+        payload["price"] = price
+
+    try:
+        r = requests.post(f"{API_BASE_URL}/orders", json=payload, timeout=5)
+        if r.status_code == 200:
+            return True, r.json()
+        else:
+            error_detail = ""
+            try:
+                error_json = r.json()
+                error_detail = error_json.get("message") or error_json.get("error", "")
+            except (json.JSONDecodeError, ValueError):
+                error_detail = r.text[:100] if r.text else f"HTTP {r.status_code}"
+            return False, error_detail or f"HTTP {r.status_code}"
+    except requests.exceptions.Timeout:
+        return False, "Request timed out - check connection"
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot connect to FIX Client - is it running?"
+    except Exception as e:
+        return False, str(e)
+
+
+def send_cancel_to_api(cl_ord_id: str, symbol: str, side: str):
+    """
+    Send cancel request to FIX Client API.
+    
+    Returns:
+        tuple: (success: bool, result: dict if success else error_message: str)
+    """
+    try:
+        r = requests.delete(
+            f"{API_BASE_URL}/orders/{cl_ord_id}",
+            params={"symbol": symbol, "side": side},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            return True, r.json()
+        else:
+            error_detail = ""
+            try:
+                error_json = r.json()
+                error_detail = error_json.get("message") or error_json.get("error", "")
+            except (json.JSONDecodeError, ValueError):
+                error_detail = r.text[:100] if r.text else f"HTTP {r.status_code}"
+            return False, error_detail or f"HTTP {r.status_code}"
+    except requests.exceptions.Timeout:
+        return False, "Cancel request timed out"
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot connect to FIX Client"
+    except Exception as e:
+        return False, str(e)
+
+
+def send_amend_to_api(cl_ord_id: str, symbol: str, side: str, new_qty: int = None, new_price: float = None):
+    """
+    Send amend request to FIX Client API.
+    
+    Returns:
+        tuple: (success: bool, result: dict if success else error_message: str)
+    """
+    payload = {"symbol": symbol, "side": side}
+    if new_qty is not None:
+        payload["newQuantity"] = int(new_qty)
+    if new_price is not None:
+        payload["newPrice"] = float(new_price)
+
+    try:
+        r = requests.put(f"{API_BASE_URL}/orders/{cl_ord_id}", json=payload, timeout=5)
+        if r.status_code == 200:
+            return True, r.json()
+        else:
+            error_detail = ""
+            try:
+                error_json = r.json()
+                error_detail = error_json.get("message") or error_json.get("error", "")
+            except (json.JSONDecodeError, ValueError):
+                error_detail = r.text[:100] if r.text else f"HTTP {r.status_code}"
+            return False, error_detail or f"HTTP {r.status_code}"
+    except requests.exceptions.Timeout:
+        return False, "Amend request timed out"
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot connect to FIX Client"
+    except Exception as e:
+        return False, str(e)
+
+
 def format_time(ts):
+    """Format timestamp for display."""
     if not ts:
         return ""
     if isinstance(ts, str):
@@ -81,6 +405,7 @@ def format_time(ts):
 
 
 def format_price(v):
+    """Format price for display. Returns 'MKT' for market orders."""
     if v is None:
         return "MKT"
     try:
@@ -88,13 +413,17 @@ def format_price(v):
         if fv <= 0:
             return "MKT"
         return f"${fv:.2f}"
-    except Exception:
+    except (TypeError, ValueError):
         return "MKT"
 
 
 def normalize_orders_for_table(orders):
+    """Normalize order data for display in the orders blotter."""
     # Statuses that are considered "open" and can be acted upon
-    OPEN_STATUSES = {"NEW", "PENDING", "PARTIALLY_FILLED", "PENDING_REPLACE", "PENDING_NEW", "PENDING_CANCEL"}
+    OPEN_STATUSES = {
+        "NEW", "PENDING", "PARTIALLY_FILLED", "PENDING_REPLACE",
+        "PENDING_NEW", "PENDING_CANCEL"
+    }
 
     out = []
     for o in orders or []:
@@ -118,6 +447,7 @@ def normalize_orders_for_table(orders):
 
 
 def normalize_execs_for_table(execs):
+    """Normalize execution data for display in the executions blotter."""
     out = []
     for e in execs or []:
         row = dict(e)
@@ -128,25 +458,27 @@ def normalize_execs_for_table(execs):
 
         try:
             row["lastPrice"] = f"${float(lp):.2f}" if lp and float(lp) > 0 else "-"
-        except Exception:
+        except (TypeError, ValueError):
             row["lastPrice"] = "-"
 
         try:
             row["avgPrice"] = f"${float(ap):.2f}" if ap and float(ap) > 0 else "-"
-        except Exception:
+        except (TypeError, ValueError):
             row["avgPrice"] = "-"
 
         out.append(row)
     return out
 
+
 def mk_stat_card(title: str, value_id: str, color=None):
+    """Create a statistics card for the dashboard header."""
     # Mantine expects a string color; guard against objects/dicts accidentally passed in
     if isinstance(color, (dict, list)):
         color = None
 
     text_kwargs = {"size": "xl", "fw": 900, "mt": 4, "id": value_id}
     if isinstance(color, str) and color.strip():
-        text_kwargs["c"] = color  # only set if it's a valid string
+        text_kwargs["c"] = color
 
     return dmc.Paper(
         p="md",
@@ -160,11 +492,11 @@ def mk_stat_card(title: str, value_id: str, color=None):
 
 
 # =============================================================================
-# UI Blocks (0.14.7-safe)
+# UI Blocks
 # =============================================================================
 
 def main_navbar():
-    """Main navigation bar with trading button"""
+    """Main navigation bar with trading button."""
     return dmc.Paper(
         p="md",
         radius=0,
@@ -185,7 +517,7 @@ def main_navbar():
                     ],
                 ),
 
-                # Center: Navigation buttons
+                # Center: Trade Button
                 dmc.Group(
                     gap="sm",
                     align="center",
@@ -198,21 +530,6 @@ def main_navbar():
                             color="blue",
                             style={"marginLeft": "45px"},
                         ),
-#                         dmc.Button(
-#                             "Analytics",
-#                             leftSection=html.I(className="fa-solid fa-chart-pie"),
-#                             variant="subtle",
-#                         ),
-#                         dmc.Button(
-#                             "Risk",
-#                             leftSection=html.I(className="fa-solid fa-shield-halved"),
-#                             variant="subtle",
-#                         ),
-#                         dmc.Button(
-#                             "Reports",
-#                             leftSection=html.I(className="fa-solid fa-file-lines"),
-#                             variant="subtle",
-#                         ),
                     ],
                 ),
 
@@ -221,7 +538,24 @@ def main_navbar():
                     gap="md",
                     align="center",
                     children=[
-                        dmc.Badge("DISCONNECTED", id="connection-badge", color="red", variant="filled", radius="sm"),
+                        dmc.Tooltip(
+                            label="Redis Pub/Sub Status",
+                            children=dmc.Badge(
+                                "REDIS",
+                                id="redis-badge",
+                                color="gray",
+                                variant="outline",
+                                radius="sm",
+                                size="sm",
+                            ),
+                        ),
+                        dmc.Badge(
+                            "DISCONNECTED",
+                            id="connection-badge",
+                            color="red",
+                            variant="filled",
+                            radius="sm"
+                        ),
                         dmc.Text(id="header-time", size="sm", c="dimmed"),
                     ],
                 ),
@@ -231,7 +565,7 @@ def main_navbar():
 
 
 def trading_drawer():
-    """Drawer/sidebar that contains the order entry panel"""
+    """Drawer/sidebar that contains the order entry panel."""
     return dmc.Drawer(
         id="trading-drawer",
         title=dmc.Group(
@@ -269,16 +603,19 @@ def trading_drawer():
                         clearable=True,
                         allowDeselect=False,
                         nothingFoundMessage="No symbols found - type to search",
-                        data=[],  # Will be populated dynamically
+                        data=[],
                         styles={
                             "input": {"textTransform": "uppercase", "fontWeight": 800},
                         },
                         comboboxProps={"withinPortal": False, "zIndex": 20000},
-                        leftSection=html.I(className="fa-solid fa-magnifying-glass", style={"fontSize": "12px"}),
+                        leftSection=html.I(
+                            className="fa-solid fa-magnifying-glass",
+                            style={"fontSize": "12px"}
+                        ),
                     ),
                     # Hidden store to track the selected symbol separately
                     dcc.Store(id="selected-symbol-store", data=None),
-                    
+
                     # Company name and validation display
                     html.Div(
                         id="drawer-symbol-info",
@@ -304,7 +641,7 @@ def trading_drawer():
                         ],
                     ),
 
-                    # Order Type selector (moved above price inputs)
+                    # Order Type selector
                     dmc.Select(
                         id="drawer-order-type-select",
                         label="Order Type",
@@ -316,7 +653,7 @@ def trading_drawer():
                         value="LIMIT",
                         mt="sm",
                     ),
-                    
+
                     # Quantity input
                     dmc.NumberInput(
                         id="drawer-quantity-input",
@@ -394,71 +731,8 @@ def trading_drawer():
     )
 
 
-def order_entry_panel():
-    return dmc.Paper(
-        p="md",
-        radius="md",
-        withBorder=True,
-        children=[
-            dmc.Group(gap="xs", children=[html.I(className="fa-solid fa-paper-plane"), dmc.Text("Order Entry", fw=800)]),
-            dmc.Space(h=10),
-
-            dmc.TextInput(
-                id="symbol-input",
-                label="Symbol",
-                placeholder="e.g. AAPL",
-                styles={"input": {"textTransform": "uppercase", "fontWeight": 800, "textAlign": "center"}},
-            ),
-
-            dmc.Group(
-                grow=True,
-                mt="sm",
-                children=[
-                    dmc.NumberInput(
-                        id="quantity-input",
-                        label="Quantity",
-                        placeholder="Shares",
-                        min=1,
-                        step=1,
-                        allowDecimal=False,
-                    ),
-                    # IMPORTANT: dmc 0.14.7 uses decimalScale/fixedDecimalScale (NOT precision)
-                    dmc.NumberInput(
-                        id="price-input",
-                        label="Price",
-                        placeholder="Limit Price",
-                        min=0,
-                        step=0.01,
-                        decimalScale=2,
-                        fixedDecimalScale=True,
-                    ),
-                ],
-            ),
-
-            dmc.Select(
-                id="order-type-select",
-                label="Order Type",
-                data=[{"value": "LIMIT", "label": "LIMIT"}, {"value": "MARKET", "label": "MARKET"}],
-                value="LIMIT",
-                mt="sm",
-            ),
-
-            dmc.Group(
-                grow=True,
-                mt="md",
-                children=[
-                    dmc.Button("BUY", id="buy-btn", color="green"),
-                    dmc.Button("SELL", id="sell-btn", color="red"),
-                ],
-            ),
-
-            dmc.Space(h=10),
-            html.Div(id="order-status-msg"),
-        ],
-    )
-
-
 def stats_row():
+    """Create the statistics cards row."""
     return dmc.SimpleGrid(
         cols=6,
         spacing="md",
@@ -474,6 +748,7 @@ def stats_row():
 
 
 def orders_blotter():
+    """Create the orders blotter table."""
     return dmc.Paper(
         p="md",
         radius="md",
@@ -483,7 +758,13 @@ def orders_blotter():
                 justify="space-between",
                 align="center",
                 children=[
-                    dmc.Group(gap="xs", children=[html.I(className="fa-solid fa-list"), dmc.Text("Orders Blotter", fw=800)]),
+                    dmc.Group(
+                        gap="xs",
+                        children=[
+                            html.I(className="fa-solid fa-list"),
+                            dmc.Text("Orders Blotter", fw=800)
+                        ]
+                    ),
                     dmc.SegmentedControl(
                         id="orders-filter",
                         value="all",
@@ -518,7 +799,7 @@ def orders_blotter():
                 style_table={"overflowX": "auto"},
                 style_cell={
                     "padding": "10px 12px",
-                    "fontFamily": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
+                    "fontFamily": "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
                     "fontSize": "12px",
                     "border": "1px solid rgba(255,255,255,0.06)",
                     "backgroundColor": "transparent",
@@ -553,10 +834,9 @@ def orders_blotter():
                     },
                     {
                         "selector": ".dash-header:hover, .dash-header--sort:hover",
-                        "rule": "background-color: rgba(255,255,255,0.04) !important; background: rgba(255,255,255,0.04) !important;",
+                        "rule": "background-color: rgba(255,255,255,0.04) !important;; background: rgba(255,255,255,0.04) !important;",
                     },
                 ],
-
                 style_cell_conditional=[
                     {
                         "if": {"column_id": "actions"},
@@ -579,7 +859,6 @@ def orders_blotter():
                     {"if": {"filter_query": "{status} = REPLACED"}, "backgroundColor": "rgba(77, 171, 247, 0.10)"},
                     {"if": {"filter_query": "{status} = REJECTED"}, "backgroundColor": "rgba(255, 107, 107, 0.12)"},
                     {"if": {"state": "selected"}, "backgroundColor": "rgba(77, 171, 247, 0.25)", "border": "1px solid rgba(77,171,247,0.7)"},
-                    # Make actions column stand out with hover-like color for cells with content
                     {
                         "if": {
                             "column_id": "actions",
@@ -595,7 +874,7 @@ def orders_blotter():
 
 
 def order_actions_modal():
-    """Modal popup for order actions (Amend/Cancel)"""
+    """Modal popup for order actions (Amend/Cancel)."""
     return dmc.Modal(
         id="order-actions-modal",
         title=dmc.Group(
@@ -716,6 +995,7 @@ def order_actions_modal():
 
 
 def executions_blotter():
+    """Create the executions blotter table."""
     return dmc.Paper(
         p="md",
         radius="md",
@@ -725,8 +1005,20 @@ def executions_blotter():
                 justify="space-between",
                 align="center",
                 children=[
-                    dmc.Group(gap="xs", children=[html.I(className="fa-solid fa-right-left"), dmc.Text("Execution Reports", fw=800)]),
-                    dmc.Button("Clear", id="clear-executions-btn", variant="outline", color="gray", size="sm"),
+                    dmc.Group(
+                        gap="xs",
+                        children=[
+                            html.I(className="fa-solid fa-right-left"),
+                            dmc.Text("Execution Reports", fw=800)
+                        ]
+                    ),
+                    dmc.Button(
+                        "Clear",
+                        id="clear-executions-btn",
+                        variant="outline",
+                        color="gray",
+                        size="sm"
+                    ),
                 ],
             ),
             dmc.Space(h=10),
@@ -791,7 +1083,6 @@ def executions_blotter():
                         "rule": "background-color: rgba(255,255,255,0.04) !important; background: rgba(255,255,255,0.04) !important;",
                     },
                 ],
-
                 style_data_conditional=[
                     {"if": {"filter_query": "{side} = BUY"}, "color": "#00d4aa", "fontWeight": "700"},
                     {"if": {"filter_query": "{side} = SELL"}, "color": "#ff6b6b", "fontWeight": "700"},
@@ -807,6 +1098,7 @@ def executions_blotter():
 
 
 def footer_bar():
+    """Create the footer bar with session info."""
     return dmc.Paper(
         p="sm",
         radius=0,
@@ -815,7 +1107,11 @@ def footer_bar():
             justify="space-between",
             align="center",
             children=[
-                dmc.Text("FIX OEMS v1.0 | Connected to localhost:8081", size="xs", c="dimmed"),
+                dmc.Text(
+                    f"FIX OEMS v1.0 | Redis: {REDIS_HOST}:{REDIS_PORT} | API: {API_BASE_URL.replace('/api', '')}",
+                    size="xs",
+                    c="dimmed"
+                ),
                 dmc.Text(id="footer-session-info", size="xs", c="dimmed"),
             ],
         ),
@@ -823,7 +1119,7 @@ def footer_bar():
 
 
 # =============================================================================
-# Layout (NO AppShell to avoid 0.14.7 slot-prop issues)
+# Layout
 # =============================================================================
 
 app.layout = dmc.MantineProvider(
@@ -835,18 +1131,22 @@ app.layout = dmc.MantineProvider(
     },
     children=[
         dcc.Interval(id="refresh-interval", interval=REFRESH_MS, n_intervals=0),
-        
-        # Interval for notification timeout (checks every second)
-        dcc.Interval(id="notification-interval", interval=1000, n_intervals=0),
-        
-        # Store for order submission timestamp (to auto-dismiss after 7s)
+
+        # Interval for notification timeout
+        dcc.Interval(
+            id="notification-interval",
+            interval=NOTIFICATION_CHECK_INTERVAL_MS,
+            n_intervals=0
+        ),
+
+        # Store for order submission timestamp (to auto-dismiss after timeout)
         dcc.Store(id="order-submission-timestamp", data=None),
 
         dcc.Store(id="clicked-outside-table", data=0),
 
-        # Store to track last action cell click (for fixing the multi-click issue)
+        # Store to track last action cell click
         dcc.Store(id="last-actions-click", data={"row": None, "clOrdId": None, "timestamp": 0}),
-        
+
         # Store for validated symbol data
         dcc.Store(id="validated-symbol-data", data=None),
 
@@ -856,7 +1156,7 @@ app.layout = dmc.MantineProvider(
         # Order Actions Modal (for amend/cancel from blotter)
         order_actions_modal(),
 
-        # Main wrapper - will have "tables-deselected" class toggled
+        # Main wrapper
         html.Div(
             id="main-click-wrapper",
             n_clicks=0,
@@ -865,9 +1165,7 @@ app.layout = dmc.MantineProvider(
                 dmc.Stack(
                     gap=0,
                     children=[
-                        # Main Navigation Bar
                         main_navbar(),
-
                         dmc.Container(
                             fluid=True,
                             p="md",
@@ -875,13 +1173,11 @@ app.layout = dmc.MantineProvider(
                                 gap="md",
                                 children=[
                                     stats_row(),
-                                    # Full width blotters (no sidebar)
                                     html.Div(id="orders-blotter-wrapper", children=[orders_blotter()]),
                                     html.Div(id="executions-blotter-wrapper", children=[executions_blotter()]),
                                 ],
                             ),
                         ),
-
                         footer_bar(),
                     ],
                 ),
@@ -891,36 +1187,42 @@ app.layout = dmc.MantineProvider(
     ],
 )
 
-# Clientside callback to handle click-outside deselection via CSS
+
+# =============================================================================
+# Clientside Callback for Click-Outside Deselection
+# =============================================================================
+
 app.clientside_callback(
     """
     function(n) {
-        if (!window._deselectListenerAdded) {
-            window._deselectListenerAdded = true;
-            window.__outsideClicks = window.__outsideClicks || 0;
-            window.__outsideClicksLastSent = window.__outsideClicksLastSent || 0;
-
+        // Namespace our globals to avoid polluting window
+        window._fixTradingUI = window._fixTradingUI || {
+            outsideClicks: 0,
+            outsideClicksLastSent: 0,
+            listenerAdded: false
+        };
+        
+        var state = window._fixTradingUI;
+        
+        if (!state.listenerAdded) {
+            state.listenerAdded = true;
 
             // Inject CSS for hiding selection
             var style = document.createElement('style');
-            style.id = 'custom-table-styles';
+            style.id = 'fix-trading-ui-table-styles';
             style.textContent = `
-              /* Hide *any* active/selected/focus styling when user clicked away */
               .tables-deselected .dash-spreadsheet-container td.cell--selected,
               .tables-deselected .dash-spreadsheet-container td.focused,
               .tables-deselected .dash-spreadsheet-container td[tabindex="0"],
               .tables-deselected .dash-spreadsheet-container td[aria-selected="true"],
               .tables-deselected .dash-spreadsheet-container td:focus,
-              .tables-deselected .dash-spreadsheet-container td:focus-within,
-              .tables-deselected .dash-spreadsheet-container td[tabindex="0"]:focus,
-              .tables-deselected .dash-spreadsheet-container td[tabindex="0"]:focus-within {
+              .tables-deselected .dash-spreadsheet-container td:focus-within {
                   background-color: transparent !important;
                   border: 1px solid rgba(255,255,255,0.06) !important;
                   box-shadow: none !important;
                   outline: none !important;
               }
 
-              /* Some builds apply focus styling to an inner div */
               .tables-deselected .dash-spreadsheet-container td > div:focus,
               .tables-deselected .dash-spreadsheet-container td:focus > div,
               .tables-deselected .dash-spreadsheet-container td:focus-within > div {
@@ -928,19 +1230,13 @@ app.clientside_callback(
                   box-shadow: none !important;
               }
 
-              /* Smooth fade when clearing selection */
               .tables-deselected .dash-spreadsheet-container td {
                   transition:
-                      background-color 10ms linear,
-                      border-color 10ms linear,
-                      box-shadow 10ms linear;
+                    background-color 10ms linear,
+                    border-color 10ms linear,
+                    box-shadow 10ms linear;
               }
 
-              /* ============================================================
-                 PREVENT HEADER HOVER - headers are th.dash-header in tbody
-                 ============================================================ */
-
-              /* Target the header cells and ALL their children */
               th.dash-header,
               th.dash-header:hover,
               th.dash-header *,
@@ -959,7 +1255,6 @@ app.clientside_callback(
                   background-color: transparent !important;
               }
 
-              /* Keep the th itself with the dark background */
               th.dash-header,
               th.dash-header:hover {
                   background: rgba(255,255,255,0.04) !important;
@@ -978,74 +1273,53 @@ app.clientside_callback(
             var wrapper = document.getElementById('main-click-wrapper');
 
             document.addEventListener('mousedown', function(e) {
-                var ordersWrapper = document.getElementById('orders-blotter-wrapper');
-                var execsWrapper = document.getElementById('executions-blotter-wrapper');
-
-                // Use closest() so we correctly detect clicks inside Mantine Drawer/Modal even if classnames differ.
-                var clickedInsideModal = !!e.target.closest('.mantine-Modal-root, [data-mantine-modal], [role="dialog"]');
-                var clickedInsideDrawer = !!e.target.closest('.mantine-Drawer-root, .mantine-Drawer-content, [data-mantine-drawer], [data-mantine-drawer-body]');
-
-                // Mantine Select/Popover dropdowns are rendered in a portal (outside the Drawer DOM).
-                // If we don't treat them as 'inside', our click-outside handler immediately blurs/closes the dropdown.
-                var clickedInsideMantineDropdown = (
-                  // dropdown/menu/popover/combobox containers
-                  !!e.target.closest(
-                    '.mantine-Select-dropdown, .mantine-Popover-dropdown, .mantine-Combobox-dropdown, .mantine-Menu-dropdown'
-                  ) ||
-                  // common option items / combobox internals
-                  !!e.target.closest(
-                    '.mantine-Select-item, .mantine-Combobox-option, .mantine-Menu-item, .mantine-Popover-target'
-                  ) ||
-                  // portal wrapper (mantine portals mount under body)
-                  !!e.target.closest('[data-mantine-portal]') ||
-                  // role-based (combobox/listbox/options)
-                  !!e.target.closest('[role="listbox"], [role="option"], [role="combobox"]')
+                var clickedInsideModal = !!e.target.closest('.mantine-Modal-root, [role="dialog"]');
+                var clickedInsideDrawer = !!e.target.closest('.mantine-Drawer-root, .mantine-Drawer-content');
+                var clickedInsideMantineDropdown = !!(
+                    e.target.closest('.mantine-Select-dropdown, .mantine-Popover-dropdown, .mantine-Combobox-dropdown') ||
+                    e.target.closest('.mantine-Select-item, .mantine-Combobox-option') ||
+                    e.target.closest('[data-mantine-portal]') ||
+                    e.target.closest('[role="listbox"], [role="option"]')
                 );
 
                 var clickedInsideOverlay = clickedInsideModal || clickedInsideDrawer || clickedInsideMantineDropdown;
-
-                var clickedInsideAnyTable =
-                  !!e.target.closest('.dash-spreadsheet-container') ||
-                  !!e.target.closest('.dash-table-container');
+                var clickedInsideAnyTable = !!(
+                    e.target.closest('.dash-spreadsheet-container') ||
+                    e.target.closest('.dash-table-container')
+                );
 
                 if (wrapper) {
                     if (clickedInsideAnyTable || clickedInsideOverlay) {
-                        // Clicked inside tables - remove deselected class to show selection
                         wrapper.classList.remove('tables-deselected');
                         if (clickedInsideAnyTable) wrapper.click();
-
                     } else {
-                        // Clicked outside tables - add deselected class to hide selection
                         wrapper.classList.add('tables-deselected');
-                        window.__outsideClicks = (window.__outsideClicks || 0) + 1;
+                        state.outsideClicks++;
 
                         if (document.activeElement && document.activeElement.blur) {
-                          document.activeElement.blur();
+                            document.activeElement.blur();
                         }
-                        // ALSO clear the existing selected/focused cell classes so it truly "unhighlights"
-                        document
-                          .querySelectorAll('.dash-spreadsheet-container td.cell--selected')
-                          .forEach((td) => td.classList.remove('cell--selected'));
-
-                        document
-                          .querySelectorAll('.dash-spreadsheet-container td.focused')
-                          .forEach((td) => td.classList.remove('focused'));
+                        
+                        document.querySelectorAll('.dash-spreadsheet-container td.cell--selected')
+                            .forEach(function(td) { td.classList.remove('cell--selected'); });
+                        document.querySelectorAll('.dash-spreadsheet-container td.focused')
+                            .forEach(function(td) { td.classList.remove('focused'); });
                     }
                 }
             });
         }
-        // Only notify Dash when an outside click actually occurred
-        if (window.__outsideClicks !== window.__outsideClicksLastSent) {
-          window.__outsideClicksLastSent = window.__outsideClicks;
-          return window.__outsideClicks;
+        
+        if (state.outsideClicks !== state.outsideClicksLastSent) {
+            state.outsideClicksLastSent = state.outsideClicks;
+            return state.outsideClicks;
         }
         return window.dash_clientside.no_update;
-
     }
     """,
     Output("clicked-outside-table", "data"),
     Input("main-click-wrapper", "n_clicks"),
 )
+
 
 # =============================================================================
 # Callbacks
@@ -1068,6 +1342,7 @@ def clear_orders_active_cell(_):
 def clear_execs_active_cell(_):
     return None
 
+
 @callback(
     Output("orders-blotter", "selected_cells", allow_duplicate=True),
     Input("clicked-outside-table", "data"),
@@ -1085,7 +1360,11 @@ def clear_orders_selected_cells(_):
 def clear_execs_selected_cells(_):
     return []
 
-@callback(Output("header-time", "children"), Input("refresh-interval", "n_intervals"))
+
+@callback(
+    Output("header-time", "children"),
+    Input("refresh-interval", "n_intervals")
+)
 def update_time(_n):
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1093,16 +1372,21 @@ def update_time(_n):
 @callback(
     Output("connection-badge", "children"),
     Output("connection-badge", "color"),
+    Output("redis-badge", "color"),
     Output("footer-session-info", "children"),
     Input("refresh-interval", "n_intervals"),
 )
 def update_connection_status(_n):
+    # Redis status from SharedState
+    redis_color = "green" if state.is_redis_connected() else "red"
+    
+    # Session status still uses HTTP (lightweight call)
     sessions = safe_get_json(f"{API_BASE_URL}/sessions", timeout=2)
     if sessions and len(sessions) > 0 and sessions[0].get("loggedOn"):
         s = sessions[0]
         footer = f"Session: {s.get('senderCompId')} → {s.get('targetCompId')}"
-        return "CONNECTED", "green", footer
-    return "DISCONNECTED", "red", "No active session"
+        return "CONNECTED", "green", redis_color, footer
+    return "DISCONNECTED", "red", redis_color, "No active session"
 
 
 @callback(
@@ -1115,7 +1399,8 @@ def update_connection_status(_n):
     Input("refresh-interval", "n_intervals"),
 )
 def update_stats(_n):
-    orders = safe_get_json(f"{API_BASE_URL}/orders", timeout=2) or []
+    # Read from SharedState (instant, no HTTP call)
+    orders = state.get_orders()
     total = len(orders)
     filled = sum(1 for o in orders if (o.get("status") or "").upper() == "FILLED")
     partial = sum(1 for o in orders if (o.get("status") or "").upper() == "PARTIALLY_FILLED")
@@ -1131,91 +1416,21 @@ def update_stats(_n):
 
 
 @callback(
-    Output("order-status-msg", "children"),
-    Output("symbol-input", "value"),
-    Output("quantity-input", "value"),
-    Output("price-input", "value"),
-    Input("buy-btn", "n_clicks"),
-    Input("sell-btn", "n_clicks"),
-    State("symbol-input", "value"),
-    State("quantity-input", "value"),
-    State("price-input", "value"),
-    State("order-type-select", "value"),
-    prevent_initial_call=True,
-)
-def submit_order(_buy, _sell, symbol, quantity, price, order_type):
-    if not ctx.triggered:
-        return "", dash.no_update, dash.no_update, dash.no_update
-
-    triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
-    side = "BUY" if triggered_id == "buy-btn" else "SELL"
-
-    if not symbol or not quantity:
-        return (
-            dmc.Alert("Enter symbol and quantity", color="yellow", variant="light"),
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
-
-    order_type = (order_type or "LIMIT").upper()
-    if order_type == "LIMIT" and (price is None or price == ""):
-        return (
-            dmc.Alert("Enter price for limit order", color="yellow", variant="light"),
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
-
-    payload = {
-        "symbol": str(symbol).upper(),
-        "side": side,
-        "orderType": order_type,
-        "quantity": int(quantity),
-    }
-    if order_type == "LIMIT":
-        payload["price"] = float(price)
-
-    try:
-        r = requests.post(f"{API_BASE_URL}/orders", json=payload, timeout=5)
-        if r.status_code == 200:
-            cid = r.json().get("clOrdId")
-            alert = dmc.Alert(
-                f"✓ {side} {order_type} order sent: {cid}",
-                color="green" if side == "BUY" else "red",
-                variant="light",
-            )
-            # Clear fields after a successful submit
-            return alert, "", None, None
-
-        return (
-            dmc.Alert("Order failed", color="red", variant="light"),
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
-    except Exception as e:
-        return (
-            dmc.Alert(f"Error: {str(e)}", color="red", variant="light"),
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
-
-
-@callback(
     Output("orders-blotter", "data"),
     Input("refresh-interval", "n_intervals"),
     Input("orders-filter", "value"),
 )
 def refresh_orders(_n, filter_value):
-    orders = safe_get_json(f"{API_BASE_URL}/orders", timeout=2) or []
+    # Read from SharedState (instant, no HTTP call)
+    orders = state.get_orders()
     fv = (filter_value or "all").lower()
 
     if fv == "working":
         orders = [
             o for o in orders
-            if (o.get("status") or "").upper() in ("NEW", "PENDING", "PARTIALLY_FILLED", "PENDING_REPLACE", "PENDING_NEW", "PENDING_CANCEL")
+            if (o.get("status") or "").upper() in (
+                "NEW", "PENDING", "PARTIALLY_FILLED", "PENDING_REPLACE", "PENDING_NEW", "PENDING_CANCEL"
+            )
         ]
     elif fv == "filled":
         orders = [o for o in orders if (o.get("status") or "").upper() == "FILLED"]
@@ -1223,9 +1438,13 @@ def refresh_orders(_n, filter_value):
     return normalize_orders_for_table(orders)
 
 
-@callback(Output("executions-blotter", "data"), Input("refresh-interval", "n_intervals"))
+@callback(
+    Output("executions-blotter", "data"),
+    Input("refresh-interval", "n_intervals")
+)
 def refresh_executions(_n):
-    execs = safe_get_json(f"{API_BASE_URL}/executions?limit=50", timeout=2) or []
+    # Read from SharedState (instant, no HTTP call)
+    execs = state.get_executions()
     return normalize_execs_for_table(execs)
 
 
@@ -1237,13 +1456,14 @@ def refresh_executions(_n):
 def clear_executions(_n):
     try:
         requests.delete(f"{API_BASE_URL}/executions", timeout=2)
-    except Exception:
-        pass
+        state.set_executions([])  # Also clear local state
+    except Exception as e:
+        print(f"[WARN] Failed to clear executions: {e}")
     return []
 
 
 # =============================================================================
-# NEW CALLBACKS FOR TRADING DRAWER
+# Trading Drawer Callbacks
 # =============================================================================
 
 @callback(
@@ -1253,15 +1473,11 @@ def clear_executions(_n):
     prevent_initial_call=True,
 )
 def toggle_trading_drawer(n_clicks, opened):
-    """Toggle the trading drawer when trading button is clicked"""
+    """Toggle the trading drawer when trading button is clicked."""
     if n_clicks:
         return not opened
     return opened
 
-
-# =============================================================================
-# SYMBOL SEARCH / AUTOCOMPLETE CALLBACKS
-# =============================================================================
 
 @callback(
     Output("drawer-symbol-input", "data"),
@@ -1276,108 +1492,93 @@ def update_symbol_options(search_value, selected_value, stored_symbol, current_d
     """
     Update symbol dropdown options based on search query.
     Fetches from the FIX Client /api/symbols/search endpoint.
-    Preserves the currently selected value in options.
     """
     triggered_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
     triggered_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
-    
+
     # If a value was just selected, store it and preserve the option
     if triggered_id == "drawer-symbol-input" and "value" in triggered_prop:
         if selected_value:
-            # Find the full option data for the selected value
             selected_option = None
             if current_data:
                 for opt in current_data:
                     if opt.get("value") == selected_value:
                         selected_option = opt
                         break
-            
+
             if selected_option:
                 return [selected_option], {"symbol": selected_value, "option": selected_option}
             else:
-                # Create a basic option if not found
                 basic_option = {"value": selected_value, "label": selected_value}
                 return [basic_option], {"symbol": selected_value, "option": basic_option}
         else:
-            # Value was cleared
             return [], None
-    
+
     # If searchValue triggered this but we have a stored symbol, keep showing it
     if stored_symbol and stored_symbol.get("symbol"):
-        stored_option = stored_symbol.get("option", {"value": stored_symbol["symbol"], "label": stored_symbol["symbol"]})
+        stored_option = stored_symbol.get(
+            "option",
+            {"value": stored_symbol["symbol"], "label": stored_symbol["symbol"]}
+        )
         stored_symbol_value = stored_symbol["symbol"]
-        
-        # If no search or empty search, just show the stored option
+
         if not search_value or len(search_value.strip()) < 1:
-            return [stored_option], dash.no_update
-        
-        # If searching, fetch results but include stored option
+            return [stored_option], None  # Clear stored_symbol on empty search
+
         results = search_symbols(search_value)
         options = []
-        seen_values = set()  # Track seen values to avoid duplicates
+        seen_values = set()
         stored_in_results = False
-        
+
         for r in results:
             symbol = r.get("symbol", "")
-            
-            # Skip if we've already seen this symbol
             if symbol in seen_values:
                 continue
             seen_values.add(symbol)
-            
+
             description = r.get("description", "")
             symbol_type = r.get("type", "")
-            
-            if description:
-                label = f"{symbol} - {description}"
-            else:
-                label = symbol
-            
+
+            label = f"{symbol} - {description}" if description else symbol
             if symbol_type and symbol_type != "Common Stock":
                 label = f"{label} ({symbol_type})"
-            
+
             options.append({"value": symbol, "label": label})
-            
+
             if symbol == stored_symbol_value:
                 stored_in_results = True
-        
-        # Only add the stored option if it's not already in results
+
         if not stored_in_results and stored_symbol_value not in seen_values:
             options.insert(0, stored_option)
-        
-        return options if options else [stored_option], dash.no_update
-    
+
+        return options if options else [stored_option], None
+
     # No stored symbol - just do a fresh search
     if not search_value or len(search_value.strip()) < 1:
-        return [], dash.no_update
-    
+        return [], None
+
     results = search_symbols(search_value)
-    
+    if results is None:
+        return dash.no_update, dash.no_update  # Don't clear on error
     options = []
-    seen_values = set()  # Track seen values to avoid duplicates
-    
+    seen_values = set()
+
     for r in results:
         symbol = r.get("symbol", "")
-        
-        # Skip if we've already seen this symbol
         if symbol in seen_values:
             continue
         seen_values.add(symbol)
-        
+
         description = r.get("description", "")
         symbol_type = r.get("type", "")
-        
-        if description:
-            label = f"{symbol} - {description}"
-        else:
-            label = symbol
-        
+
+        label = f"{symbol} - {description}" if description else symbol
         if symbol_type and symbol_type != "Common Stock":
             label = f"{label} ({symbol_type})"
-        
+
         options.append({"value": symbol, "label": label})
-    
-    return options if options else [], dash.no_update
+
+    return options if options else [], None
 
 
 @callback(
@@ -1388,16 +1589,12 @@ def update_symbol_options(search_value, selected_value, stored_symbol, current_d
     prevent_initial_call=True,
 )
 def validate_and_display_symbol(symbol, previous_validation):
-    """
-    Validate selected symbol and display company info.
-    Shows company name, current price, and validation status.
-    """
+    """Validate selected symbol and display company info."""
     if not symbol:
         return [], None
-    
-    # Validate the symbol
+
     validation = validate_symbol(symbol)
-    
+
     if not validation:
         return [
             dmc.Text(
@@ -1407,36 +1604,36 @@ def validate_and_display_symbol(symbol, previous_validation):
                 style={"fontStyle": "italic"},
             )
         ], None
-    
+
     is_valid = validation.get("valid", False)
     company_name = validation.get("name", "")
     current_price = validation.get("currentPrice")
     change = validation.get("change")
     change_percent = validation.get("changePercent")
     validation_msg = validation.get("validationMessage", "")
-    
+
     if not is_valid:
         return [
             dmc.Group(
                 gap="xs",
                 children=[
-                    html.I(className="fa-solid fa-circle-xmark", style={"color": "#ff6b6b", "fontSize": "12px"}),
-                    dmc.Text(
-                        validation_msg or "Invalid symbol",
-                        size="xs",
-                        c="red",
+                    html.I(
+                        className="fa-solid fa-circle-xmark",
+                        style={"color": "#ff6b6b", "fontSize": "12px"}
                     ),
+                    dmc.Text(validation_msg or "Invalid symbol", size="xs", c="red"),
                 ],
             )
         ], None
-    
+
     # Build the info display for valid symbols
-    info_parts = []
-    
-    # Valid indicator
-    info_parts.append(html.I(className="fa-solid fa-circle-check", style={"color": "#00d4aa", "fontSize": "12px"}))
-    
-    # Company name
+    info_parts = [
+        html.I(
+            className="fa-solid fa-circle-check",
+            style={"color": "#00d4aa", "fontSize": "12px"}
+        )
+    ]
+
     if company_name:
         info_parts.append(
             dmc.Text(
@@ -1444,47 +1641,30 @@ def validate_and_display_symbol(symbol, previous_validation):
                 size="xs",
                 c="dimmed",
                 fw=500,
-                style={"maxWidth": "200px", "overflow": "hidden", "textOverflow": "ellipsis", "whiteSpace": "nowrap"},
+                style={
+                    "maxWidth": "200px",
+                    "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                    "whiteSpace": "nowrap"
+                },
             )
         )
-    
-    # Price info
+
     if current_price is not None:
-        price_text = f"${float(current_price):.2f}"
-        
-        # Add change info if available
         if change is not None and change_percent is not None:
             change_val = float(change)
             change_pct = float(change_percent)
             change_color = "#00d4aa" if change_val >= 0 else "#ff6b6b"
             change_sign = "+" if change_val >= 0 else ""
             price_text = f"${float(current_price):.2f} ({change_sign}{change_val:.2f}, {change_sign}{change_pct:.2f}%)"
-            
-            info_parts.append(
-                dmc.Text(
-                    price_text,
-                    size="xs",
-                    c=change_color,
-                    fw=600,
-                )
-            )
+
+            info_parts.append(dmc.Text(price_text, size="xs", c=change_color, fw=600))
         else:
             info_parts.append(
-                dmc.Text(
-                    price_text,
-                    size="xs",
-                    c="blue",
-                    fw=600,
-                )
+                dmc.Text(f"${float(current_price):.2f}", size="xs", c="blue", fw=600)
             )
-    
-    return [
-        dmc.Group(
-            gap="xs",
-            align="center",
-            children=info_parts,
-        )
-    ], validation
+
+    return [dmc.Group(gap="xs", align="center", children=info_parts)], validation
 
 
 @callback(
@@ -1496,13 +1676,8 @@ def validate_and_display_symbol(symbol, previous_validation):
     Output("order-submission-timestamp", "data"),
     Output("selected-symbol-store", "data", allow_duplicate=True),
     Output("drawer-symbol-info", "children", allow_duplicate=True),
-
     Input("drawer-buy-btn", "n_clicks"),
     Input("drawer-sell-btn", "n_clicks"),
-    Input("qty-100", "n_clicks"),
-    Input("qty-500", "n_clicks"),
-    Input("qty-1000", "n_clicks"),
-    Input("qty-5000", "n_clicks"),
     State("drawer-symbol-input", "value"),
     State("drawer-quantity-input", "value"),
     State("drawer-price-input", "value"),
@@ -1511,38 +1686,45 @@ def validate_and_display_symbol(symbol, previous_validation):
     State("validated-symbol-data", "data"),
     prevent_initial_call=True,
 )
-def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty5000,
-                         symbol, quantity, price, stop_price, order_type, validated_data):
-    """Handle order submission from the trading drawer"""
-    import time
+def handle_drawer_orders(
+    buy_clicks, sell_clicks,
+    symbol, quantity, price, stop_price, order_type, validated_data
+):
+    """Handle order submission from the trading drawer."""
+    import dash
 
-    # 8 outputs in this callback:
-    # (status msg, symbol, quantity, price, stop_price, submission_timestamp, selected_symbol_store, symbol_info)
-    no_update = (dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update)
+    # Helper for returning no-update tuple
+    def no_update_all():
+        return (
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        )
 
     if not ctx.triggered:
-        return no_update
+        return no_update_all()
 
     triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
 
-    # Quick quantity buttons are handled by a separate callback; do nothing here.
-    if triggered_id.startswith("qty-"):
-        return no_update
+    # Determine side from which button was clicked
+    if triggered_id == "drawer-buy-btn":
+        side = "BUY"
+    elif triggered_id == "drawer-sell-btn":
+        side = "SELL"
+    else:
+        return no_update_all()
 
-    # Handle buy/sell orders
-    side = "BUY" if triggered_id == "drawer-buy-btn" else "SELL"
-
+    # Validation
     if not symbol:
         return (
             dmc.Alert("Enter a symbol", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update
         )
 
     # Validate symbol before submission
     if validated_data is None:
-        # Symbol wasn't validated yet, try to validate now
         validated_data = validate_symbol(symbol)
-    
+
     if validated_data is None or not validated_data.get("valid", False):
         error_msg = "Invalid symbol"
         if validated_data and validated_data.get("validationMessage"):
@@ -1554,75 +1736,58 @@ def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty50
                 variant="light",
                 title="Symbol Validation Failed",
             ),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update
         )
 
     if not quantity:
         return (
             dmc.Alert("Enter quantity", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update
         )
 
     order_type = (order_type or "LIMIT").upper()
 
-    # Validate price requirements based on order type
     if order_type == "LIMIT" and (price is None or price == ""):
         return (
             dmc.Alert("Enter limit price for LIMIT order", color="yellow", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update
         )
 
-    # Build payload
-    payload = {
-        "symbol": str(symbol).upper(),
-        "side": side,
-        "orderType": order_type,
-        "quantity": int(quantity),
-    }
+    # Send order
+    success, result = send_order_to_api(
+        symbol=symbol,
+        side=side,
+        order_type=order_type,
+        quantity=int(quantity),
+        price=float(price) if order_type == "LIMIT" and price else None
+    )
 
-    if order_type == "LIMIT":
-        payload["price"] = float(price)
+    if success:
+        cid = result.get("clOrdId", "")
+        current_time = time.time()
+        price_info = f" @ ${float(price):.2f}" if order_type == "LIMIT" else ""
+        company_name = validated_data.get("name", "")
+        symbol_display = f"{symbol} ({company_name})" if company_name else symbol
 
-    try:
-        r = requests.post(f"{API_BASE_URL}/orders", json=payload, timeout=5)
-        if r.status_code == 200:
-            cid = r.json().get("clOrdId")
-            current_time = time.time()
+        alert = dmc.Alert(
+            f"✓ {side} {order_type} order sent for {symbol_display}: {cid}{price_info}",
+            color="green" if side == "BUY" else "red",
+            variant="light",
+            title="Order Submitted",
+        )
 
-            price_info = f" @ ${float(price):.2f}" if order_type == "LIMIT" else ""
-            
-            # Include company name in confirmation if available
-            company_name = validated_data.get("name", "")
-            symbol_display = f"{symbol} ({company_name})" if company_name else symbol
-
-            alert = dmc.Alert(
-                f"✓ {side} {order_type} order sent for {symbol_display}: {cid}{price_info}",
-                color="green" if side == "BUY" else "red",
-                variant="light",
-                title="Order Submitted",
-            )
-
-            # Clear fields immediately while drawer stays open
-            # Use "" (empty string) instead of None to properly clear NumberInput fields visually
-            return (alert, None, "", "", "", current_time, None, [])
-
-        # Handle error response
-        error_detail = ""
-        try:
-            error_json = r.json()
-            error_detail = error_json.get("message", "")
-        except Exception:
-            pass
-        
+        # Clear fields after successful submit
+        return (alert, None, "", "", "", current_time, None, [])
+    else:
         return (
-            dmc.Alert(f"Order failed{': ' + error_detail if error_detail else ''}", color="red", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+            dmc.Alert(f"Order failed: {result}", color="red", variant="light"),
+            dash.no_update, dash.no_update, dash.no_update, dash.no_update,
+            dash.no_update, dash.no_update, dash.no_update
         )
-    except Exception as e:
-        return (
-            dmc.Alert(f"Error: {str(e)}", color="red", variant="light"),
-            dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-        )
+
 
 @callback(
     Output("drawer-quantity-input", "value"),
@@ -1634,7 +1799,9 @@ def handle_drawer_orders(buy_clicks, sell_clicks, qty100, qty500, qty1000, qty50
     prevent_initial_call=True,
 )
 def set_quick_quantity(qty100, qty500, qty1000, qty5000, current_qty):
-    """Set quantity based on quick quantity buttons"""
+    """Set quantity based on quick quantity buttons."""
+    import dash
+
     if not ctx.triggered:
         return dash.no_update
 
@@ -1658,16 +1825,15 @@ def set_quick_quantity(qty100, qty500, qty1000, qty5000, current_qty):
     prevent_initial_call=True,
 )
 def auto_dismiss_notification(n_intervals, submission_time, current_msg):
-    """Auto-dismiss notification after 4 seconds"""
-    import time
-    
+    """Auto-dismiss notification after configured timeout."""
+    import dash
+
     if submission_time is None:
         return dash.no_update
-    
-    # Check if 4 seconds have passed
-    if time.time() - submission_time >= 4:
-        return ""  # Clear the notification
-    
+
+    if time.time() - submission_time >= NOTIFICATION_TIMEOUT_SECONDS:
+        return ""
+
     return dash.no_update
 
 
@@ -1678,44 +1844,36 @@ def auto_dismiss_notification(n_intervals, submission_time, current_msg):
     Input("drawer-order-type-select", "value"),
 )
 def update_price_fields_visibility(order_type):
-    """Show/hide price fields based on order type"""
+    """Show/hide price fields based on order type."""
     order_type = (order_type or "LIMIT").upper()
-    
-    # Define styles
+
     show_style = {"flex": 1}
     hide_style = {"flex": 1, "display": "none"}
-    
+
     if order_type == "MARKET":
-        # Hide both price fields
         return hide_style, "Limit Price", hide_style
     elif order_type == "LIMIT":
-        # Show only limit price
         return show_style, "Limit Price", hide_style
     elif order_type == "STOP":
-        # Show only stop price (in the limit price slot for cleaner UI)
         return hide_style, "Limit Price", show_style
     elif order_type == "STOP_LIMIT":
-        # Show both
         return show_style, "Limit Price", show_style
-    
-    # Default - show limit price only
+
     return show_style, "Limit Price", hide_style
 
 
 # =============================================================================
-# ORDER ACTIONS MODAL CALLBACKS - FIXED VERSION 2
+# Order Actions Modal Callbacks
 # =============================================================================
-# Using cell click timestamp tracking via clientside callback
 
-# Clientside callback to detect ANY cell click and record timestamp
+# Clientside callback to detect actions cell click
 app.clientside_callback(
     """
-    function(active_cell,selected_cells, n_clicks, viewport_data) {
+    function(active_cell, selected_cells, n_clicks, viewport_data) {
         if (!active_cell || !viewport_data) {
             return window.dash_clientside.no_update;
         }
 
-        // Only care about actions column
         if (active_cell.column_id !== 'actions') {
             return window.dash_clientside.no_update;
         }
@@ -1725,7 +1883,6 @@ app.clientside_callback(
             return window.dash_clientside.no_update;
         }
 
-        // IMPORTANT: use the *visible/sorted* rows
         var row = viewport_data[row_idx];
         if (!row || !row.actions) {
             return window.dash_clientside.no_update;
@@ -1762,11 +1919,9 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 def open_actions_modal(click_data):
-    """
-    Open the actions modal when the last-actions-click store updates.
-    This is triggered by the clientside callback that detects cell clicks.
-    """
-    # Default "no action" return
+    """Open the actions modal when the last-actions-click store updates."""
+    import dash
+
     no_action = (
         dash.no_update, dash.no_update, dash.no_update, dash.no_update,
         dash.no_update, dash.no_update, dash.no_update, dash.no_update,
@@ -1780,11 +1935,9 @@ def open_actions_modal(click_data):
     if not row:
         return no_action
 
-    # Only open modal for orders that have actions (open orders)
     if not row.get("actions"):
         return no_action
 
-    # Determine colors based on side and status
     side = row.get("side", "")
     side_color = "#00d4aa" if side == "BUY" else "#ff6b6b"
 
@@ -1799,18 +1952,17 @@ def open_actions_modal(click_data):
     }
     status_color = status_color_map.get(status, "gray")
 
-    # Parse price for the amend input
     price_val = None
     price_str = row.get("price", "")
     if price_str and price_str != "MKT":
         try:
             price_val = float(str(price_str).replace("$", ""))
-        except Exception:
+        except (TypeError, ValueError):
             price_val = None
 
     return (
-        True,  # Open modal
-        row,   # Store order data
+        True,
+        row,
         row.get("clOrdId", ""),
         row.get("symbol", ""),
         side,
@@ -1833,7 +1985,9 @@ def open_actions_modal(click_data):
     prevent_initial_call=True,
 )
 def handle_modal_actions(amend_clicks, cancel_clicks, order_data, new_qty, new_price):
-    """Handle amend and cancel actions from the modal"""
+    """Handle amend and cancel actions from the modal."""
+    import dash
+
     if not ctx.triggered or not order_data:
         return "", dash.no_update
 
@@ -1845,49 +1999,81 @@ def handle_modal_actions(amend_clicks, cancel_clicks, order_data, new_qty, new_p
     if not clordid:
         return dmc.Alert("No order selected", color="yellow", variant="light"), dash.no_update
 
-    try:
-        if triggered_id == "modal-cancel-btn":
-            r = requests.delete(
-                f"{API_BASE_URL}/orders/{clordid}",
-                params={"symbol": symbol, "side": side},
-                timeout=5,
+    if triggered_id == "modal-cancel-btn":
+        success, result = send_cancel_to_api(clordid, symbol, side)
+        if success:
+            return (
+                dmc.Alert("✓ Cancel request sent", color="blue", variant="light"),
+                False,
             )
-            if r.status_code == 200:
-                return (
-                    dmc.Alert("✓ Cancel request sent", color="blue", variant="light"),
-                    False,  # Close modal
-                )
-            return dmc.Alert("Cancel failed", color="red", variant="light"), dash.no_update
+        return dmc.Alert(f"Cancel failed: {result}", color="red", variant="light"), dash.no_update
 
-        if triggered_id == "modal-amend-btn":
-            if not new_qty and not new_price:
-                return dmc.Alert("Enter new quantity or price", color="yellow", variant="light"), dash.no_update
+    if triggered_id == "modal-amend-btn":
+        if not new_qty and not new_price:
+            return (
+                dmc.Alert("Enter new quantity or price", color="yellow", variant="light"),
+                dash.no_update
+            )
 
-            payload = {"symbol": symbol, "side": side}
-            if new_qty:
-                payload["newQuantity"] = int(new_qty)
-            if new_price:
-                payload["newPrice"] = float(new_price)
+        success, result = send_amend_to_api(
+            clordid, symbol, side,
+            new_qty=int(new_qty) if new_qty else None,
+            new_price=float(new_price) if new_price else None
+        )
+        if success:
+            return (
+                dmc.Alert("✓ Amend request sent", color="blue", variant="light"),
+                False,
+            )
+        return dmc.Alert(f"Amend failed: {result}", color="red", variant="light"), dash.no_update
 
-            r = requests.put(f"{API_BASE_URL}/orders/{clordid}", json=payload, timeout=5)
-            if r.status_code == 200:
-                return (
-                    dmc.Alert("✓ Amend request sent", color="blue", variant="light"),
-                    False,  # Close modal
-                )
-            return dmc.Alert("Amend failed", color="red", variant="light"), dash.no_update
+    return "", dash.no_update
 
-        return "", dash.no_update
 
+# =============================================================================
+# Startup: Load initial data and start Redis subscriber
+# =============================================================================
+
+def _fetch_initial_data():
+    """Load current state from REST API on startup."""
+    print("[Startup] Fetching initial data from FIX Client...")
+    try:
+        orders = safe_get_json(f"{API_BASE_URL}/orders", timeout=5) or []
+        state.update_orders(orders)
+        print(f"[Startup] Loaded {len(orders)} orders")
+        
+        execs = safe_get_json(f"{API_BASE_URL}/executions?limit=100", timeout=5) or []
+        state.set_executions(execs)
+        print(f"[Startup] Loaded {len(execs)} executions")
     except Exception as e:
-        return dmc.Alert(f"Error: {str(e)}", color="red", variant="light"), dash.no_update
+        print(f"[Startup] Failed to fetch initial data: {e}")
 
+
+# Initialize on module load
+_fetch_initial_data()
+
+# Only start Redis subscriber in the main process (not the reloader)
+# When debug=True, Dash spawns a reloader process. We check for WERKZEUG_RUN_MAIN
+# to ensure we only start one subscriber in the actual running process.
+import os as _os
+if _os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.server.debug:
+    _redis_subscriber = RedisSubscriber(state)
+    _redis_subscriber.start()
+else:
+    print("[Startup] Skipping Redis subscriber in reloader parent process")
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
     print("  FIX OEMS - Order & Execution Management System")
+    print("  (Redis Pub/Sub Edition)")
     print("=" * 60)
-    print(f"  API: {API_BASE_URL}")
-    print("  UI:  http://localhost:8050")
+    print(f"  API:   {API_BASE_URL}")
+    print(f"  Redis: {REDIS_HOST}:{REDIS_PORT}")
+    print("  UI:    http://localhost:8050")
     print("=" * 60)
     app.run(debug=True, host="0.0.0.0", port=8050)
